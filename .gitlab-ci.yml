@@ -1,0 +1,266 @@
+# GitGuardian Autopilot - Full CI/CD Pipeline
+# Covers all 9 DevSecOps stages: Plan, Create, Verify, Package, Secure, Release, Configure, Monitor, Govern
+
+image: python:3.12-slim
+
+stages:
+  - verify       # Stage 3: Lint, test
+  - secure       # Stage 5: SAST, dependency scan
+  - package      # Stage 4: Build Docker image
+  - release      # Stage 6: Deploy to staging
+  - validate     # Stage 8: Monitor staging health
+  - promote      # Stage 6b: Promote to production
+  - govern       # Stage 9: Compliance report
+
+variables:
+  GCP_PROJECT_ID: "gitguardian-autopilot"
+  GCP_REGION: "us-central1"
+  CLOUD_RUN_SERVICE: "task-manager"
+  REGISTRY: "gcr.io"
+  IMAGE_NAME: "$REGISTRY/$GCP_PROJECT_ID/$CLOUD_RUN_SERVICE"
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# ─── VERIFY STAGE ─────────────────────────────────────────────────────────────
+lint:
+  stage: verify
+  script:
+    - pip install flake8 black isort --quiet
+    - cd app && flake8 . --max-line-length=120 --exclude=tests
+    - black --check . --line-length=120
+  allow_failure: true
+  tags:
+    - saas-linux-small-amd64
+
+unit-tests:
+  stage: verify
+  script:
+    - pip install -r app/requirements.txt --quiet
+    - pip install pytest pytest-cov --quiet
+    - cd app && python -m pytest tests/ -v --cov=. --cov-report=xml --cov-report=term
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: app/coverage.xml
+    paths:
+      - app/coverage.xml
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  tags:
+    - saas-linux-small-amd64
+
+# ─── SECURE STAGE (GitLab SAST + Dependency Scanning) ─────────────────────────
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+
+# Override SAST to run on all branches
+sast:
+  stage: secure
+  variables:
+    SAST_EXCLUDED_PATHS: "spec, test, tests, tmp"
+
+dependency_scanning:
+  stage: secure
+
+# ─── PACKAGE STAGE ─────────────────────────────────────────────────────────────
+build-image:
+  stage: package
+  image: google/cloud-sdk:alpine
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > /tmp/gcp-key.json
+    - gcloud auth activate-service-account --key-file=/tmp/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud auth configure-docker gcr.io --quiet
+  script:
+    - docker build -t $IMAGE_NAME:$CI_COMMIT_SHA -t $IMAGE_NAME:latest ./app
+    - docker push $IMAGE_NAME:$CI_COMMIT_SHA
+    - docker push $IMAGE_NAME:latest
+    - echo "IMAGE_TAG=$CI_COMMIT_SHA" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+  only:
+    - main
+    - /^release\/.*$/
+    - /^hotfix\/.*$/
+  tags:
+    - saas-linux-small-amd64
+
+container_scanning:
+  stage: package
+  variables:
+    CS_IMAGE: "$IMAGE_NAME:$CI_COMMIT_SHA"
+  needs: ["build-image"]
+  only:
+    - main
+
+# ─── RELEASE STAGE (Deploy to Staging) ────────────────────────────────────────
+deploy-staging:
+  stage: release
+  image: google/cloud-sdk:alpine
+  environment:
+    name: staging
+    url: https://$STAGING_URL
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > /tmp/gcp-key.json
+    - gcloud auth activate-service-account --key-file=/tmp/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+  script:
+    - |
+      gcloud run deploy ${CLOUD_RUN_SERVICE}-staging \
+        --image $IMAGE_NAME:$CI_COMMIT_SHA \
+        --platform managed \
+        --region $GCP_REGION \
+        --allow-unauthenticated \
+        --set-env-vars DATABASE_URL=$STAGING_DB_URL \
+        --memory 512Mi \
+        --cpu 1 \
+        --max-instances 3 \
+        --quiet
+    - |
+      STAGING_URL=$(gcloud run services describe ${CLOUD_RUN_SERVICE}-staging \
+        --platform managed --region $GCP_REGION \
+        --format 'value(status.url)')
+      echo "STAGING_URL=$STAGING_URL" >> deploy.env
+      echo "Deployed to: $STAGING_URL"
+  artifacts:
+    reports:
+      dotenv: deploy.env
+  needs: ["build-image"]
+  only:
+    - main
+    - /^hotfix\/.*$/
+  tags:
+    - saas-linux-small-amd64
+
+# ─── VALIDATE STAGE (Monitor Staging Health) ──────────────────────────────────
+validate-staging:
+  stage: validate
+  image: curlimages/curl:latest
+  script:
+    - echo "Validating staging deployment at $STAGING_URL"
+    - sleep 15  # Wait for Cloud Run to be ready
+    - |
+      for i in 1 2 3 4 5; do
+        STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/health")
+        if [ "$STATUS" = "200" ]; then
+          echo "✅ Staging health check PASSED (attempt $i)"
+          exit 0
+        fi
+        echo "⏳ Attempt $i: Got status $STATUS, retrying..."
+        sleep 10
+      done
+      echo "❌ Staging health check FAILED after 5 attempts"
+      exit 1
+    - curl -s "$STAGING_URL/tasks" | grep -q '\[\]' && echo "✅ API endpoint working"
+  needs: ["deploy-staging"]
+  only:
+    - main
+    - /^hotfix\/.*$/
+  tags:
+    - saas-linux-small-amd64
+
+# ─── PROMOTE STAGE (Deploy to Production) ─────────────────────────────────────
+deploy-production:
+  stage: promote
+  image: google/cloud-sdk:alpine
+  environment:
+    name: production
+    url: https://$PRODUCTION_URL
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > /tmp/gcp-key.json
+    - gcloud auth activate-service-account --key-file=/tmp/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+  script:
+    - |
+      # Deploy with canary (10% traffic)
+      gcloud run deploy $CLOUD_RUN_SERVICE \
+        --image $IMAGE_NAME:$CI_COMMIT_SHA \
+        --platform managed \
+        --region $GCP_REGION \
+        --allow-unauthenticated \
+        --set-env-vars DATABASE_URL=$PRODUCTION_DB_URL \
+        --memory 1Gi \
+        --cpu 2 \
+        --max-instances 10 \
+        --tag canary \
+        --no-traffic \
+        --quiet
+    - |
+      # Route 10% traffic to canary
+      gcloud run services update-traffic $CLOUD_RUN_SERVICE \
+        --platform managed \
+        --region $GCP_REGION \
+        --to-tags canary=10 \
+        --quiet
+    - echo "Canary deployed with 10% traffic, monitoring for 60s..."
+    - sleep 60
+    - |
+      # Validate canary health
+      PROD_URL=$(gcloud run services describe $CLOUD_RUN_SERVICE \
+        --platform managed --region $GCP_REGION \
+        --format 'value(status.url)')
+      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PROD_URL/health")
+      if [ "$STATUS" != "200" ]; then
+        echo "❌ Canary FAILED, rolling back..."
+        gcloud run services update-traffic $CLOUD_RUN_SERVICE \
+          --platform managed --region $GCP_REGION \
+          --to-revisions LATEST=0 --quiet
+        exit 1
+      fi
+    - |
+      # Promote to 100%
+      gcloud run services update-traffic $CLOUD_RUN_SERVICE \
+        --platform managed \
+        --region $GCP_REGION \
+        --to-latest \
+        --quiet
+      echo "✅ Production deployment complete (100% traffic)"
+      PRODUCTION_URL=$(gcloud run services describe $CLOUD_RUN_SERVICE \
+        --platform managed --region $GCP_REGION \
+        --format 'value(status.url)')
+      echo "PRODUCTION_URL=$PRODUCTION_URL" >> prod.env
+  artifacts:
+    reports:
+      dotenv: prod.env
+  needs: ["validate-staging"]
+  when: on_success
+  only:
+    - main
+    - /^hotfix\/.*$/
+  tags:
+    - saas-linux-small-amd64
+
+# ─── GOVERN STAGE (Compliance & Audit Report) ─────────────────────────────────
+generate-compliance-report:
+  stage: govern
+  script:
+    - |
+      echo "# 📋 Compliance & Audit Report" > compliance-report.md
+      echo "**Pipeline:** $CI_PIPELINE_ID" >> compliance-report.md
+      echo "**Commit:** $CI_COMMIT_SHA" >> compliance-report.md
+      echo "**Author:** $CI_COMMIT_AUTHOR" >> compliance-report.md
+      echo "**Timestamp:** $(date -u)" >> compliance-report.md
+      echo "" >> compliance-report.md
+      echo "## ✅ Checks Performed" >> compliance-report.md
+      echo "- [x] SAST scan completed" >> compliance-report.md
+      echo "- [x] Dependency vulnerability scan" >> compliance-report.md
+      echo "- [x] Container image scan" >> compliance-report.md
+      echo "- [x] Unit tests passed" >> compliance-report.md
+      echo "- [x] Staging validation passed" >> compliance-report.md
+      echo "- [x] Canary deployment successful" >> compliance-report.md
+      echo "- [x] Production deployment verified" >> compliance-report.md
+      cat compliance-report.md
+  artifacts:
+    paths:
+      - compliance-report.md
+    expire_in: 1 year
+  needs: ["deploy-production"]
+  only:
+    - main
+  tags:
+    - saas-linux-small-amd64

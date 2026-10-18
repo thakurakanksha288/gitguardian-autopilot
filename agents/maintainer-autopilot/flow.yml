@@ -1,0 +1,111 @@
+# GitLab Duo Agent Platform - Maintainer Autopilot Flow
+# MIT License - GitGuardian Autopilot
+# Runs on a daily schedule to handle routine maintenance tasks
+
+name: maintainer-autopilot
+description: |
+  Daily maintenance agent that handles issue triage, dependency updates,
+  MR reviews, security patching, and release note generation automatically.
+
+trigger:
+  type: schedule
+  cron: "0 9 * * *"  # Run daily at 9 AM UTC
+
+tools:
+  - name: gitlab_api
+    type: mcp
+    server: agents/self-healing/tools/gitlab_api_mcp.py
+    description: Full GitLab API access
+  - name: dependency_scanner
+    type: builtin
+    name: gitlab_duo_dependency_scanner
+    description: Scan dependencies for vulnerabilities
+
+steps:
+  - id: triage_issues
+    name: "1. Triage Open Issues"
+    prompt: |
+      Get all open issues in the project that have no labels assigned.
+      For each unlabeled issue:
+      1. Read the title and description
+      2. Assign appropriate labels from: [bug, feature, documentation, question, good-first-issue, security, performance]
+      3. Set a priority label: [priority::high, priority::medium, priority::low]
+      4. Add a brief triage comment explaining your assessment
+      
+      Triage up to 10 issues per run.
+    tools: [gitlab_api]
+    output: triage_summary
+
+  - id: review_open_mrs
+    name: "2. Review Open MRs"
+    prompt: |
+      Get all open Merge Requests.
+      For each MR that has no reviewer assigned and has been open for more than 24 hours:
+      1. Read the MR title, description, and diff
+      2. Check for:
+         - Missing tests
+         - Security concerns (hardcoded secrets, SQL injection, etc.)
+         - Code style issues
+         - Missing documentation
+      3. Post a review comment with findings
+      4. If the MR looks good, add the label "reviewed-by-bot" and approve
+      
+      Review up to 5 MRs per run.
+    tools: [gitlab_api]
+    output: mr_review_summary
+
+  - id: patch_dependencies
+    name: "3. Patch Vulnerable Dependencies"
+    prompt: |
+      Check the dependency scanning results from the latest pipeline.
+      For each CRITICAL or HIGH severity vulnerability:
+      1. Identify the affected package and the fixed version
+      2. Create a branch: deps/patch-{{ package_name }}-{{ date }}
+      3. Update the requirements.txt or package.json with the fixed version
+      4. Create a MR with title: "security: patch {{ package_name }} vulnerability [CVE-XXXX]"
+      5. Set merge_when_pipeline_succeeds: true
+      
+      Patch up to 5 vulnerabilities per run.
+    tools: [gitlab_api]
+    output: patch_summary
+
+  - id: generate_release_notes
+    name: "4. Generate Release Notes"
+    prompt: |
+      Get all MRs merged in the last 7 days.
+      Group them by type:
+      - 🐛 Bug Fixes (MRs with label "bug")
+      - ✨ New Features (MRs with label "feature")
+      - 🔒 Security Patches (MRs with label "security")
+      - 📝 Documentation (MRs with label "documentation")
+      - 🔧 Maintenance (all others)
+      
+      Generate release notes in markdown format and post them as a comment
+      on the most recent issue with label "release".
+      If no such issue exists, create one titled "Release Notes - Week of {{ date }}".
+    tools: [gitlab_api]
+    output: release_notes
+
+  - id: daily_summary
+    name: "5. Post Daily Summary"
+    prompt: |
+      Post a daily maintenance summary as a new issue titled:
+      "📊 Daily Maintenance Report - {{ date }}"
+      
+      Include:
+      ## Triage
+      {{ steps.triage_issues.triage_summary }}
+      
+      ## MR Reviews
+      {{ steps.review_open_mrs.mr_review_summary }}
+      
+      ## Security Patches
+      {{ steps.patch_dependencies.patch_summary }}
+      
+      ## Release Notes Generated
+      {{ steps.generate_release_notes.release_notes }}
+      
+      Labels: ["maintenance", "bot-report"]
+      Close the issue immediately after creating it (it's just an audit trail).
+    tools: [gitlab_api]
+    output: daily_report

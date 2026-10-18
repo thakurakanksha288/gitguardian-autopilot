@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+venv/
+.env
+.venv
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+*.db
+test.db
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+*.tfvars
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+*.tar
+
+# Secrets
+*.pem
+*.key
+/tmp/gcp-key.json

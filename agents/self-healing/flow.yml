@@ -1,0 +1,180 @@
+# GitLab Duo Agent Platform - Self-Healing Production Flow
+# MIT License - GitGuardian Autopilot
+# This flow is triggered by a Cloud Monitoring webhook alert
+# It automatically detects, diagnoses, fixes, and deploys a production fix
+
+name: self-healing-production
+description: |
+  Autonomous production incident response agent.
+  Detects incidents, traces root causes, generates fixes,
+  runs security checks, and deploys to production automatically.
+
+trigger:
+  type: webhook
+  secret_variable: WEBHOOK_SECRET
+
+tools:
+  - name: cloud_logging
+    type: mcp
+    server: agents/self-healing/tools/cloud_logging_mcp.py
+    description: Query Google Cloud Logging for error traces
+  - name: gitlab_api
+    type: mcp
+    server: agents/self-healing/tools/gitlab_api_mcp.py
+    description: Interact with GitLab API (issues, MRs, pipelines, commits)
+  - name: code_editor
+    type: builtin
+    name: gitlab_duo_code_editor
+    description: Edit files in the repository
+
+steps:
+  - id: acknowledge_incident
+    name: "1. Acknowledge Incident"
+    prompt: |
+      An alert has been triggered. Analyze the webhook payload:
+      {{ trigger.payload }}
+      
+      Extract:
+      - Alert name and severity
+      - Affected service/endpoint
+      - Error type and message
+      - Timestamp of first occurrence
+      
+      Create a GitLab issue titled "[INCIDENT] {{ alert_name }} - Auto-healing initiated"
+      with label "incident" and "auto-healing" and priority "high".
+      Post the extracted incident details as the issue description.
+    tools: [gitlab_api]
+    output: incident_context
+
+  - id: investigate_logs
+    name: "2. Investigate Cloud Logs"
+    prompt: |
+      Using the incident context: {{ steps.acknowledge_incident.incident_context }}
+      
+      Query Cloud Logging for the last 30 minutes of logs from the affected service.
+      Find:
+      - The exact error stack trace
+      - The specific endpoint/function that is failing
+      - Request patterns that trigger the error
+      - First occurrence timestamp
+      
+      Return a structured analysis with: error_type, stack_trace, failing_function, error_message
+    tools: [cloud_logging]
+    output: log_analysis
+
+  - id: trace_breaking_commit
+    name: "3. Trace Breaking Commit"
+    prompt: |
+      Using the log analysis: {{ steps.investigate_logs.log_analysis }}
+      
+      Using the GitLab API:
+      1. Get the last 10 commits on the main branch
+      2. Find the commit that introduced the breaking change by correlating
+         the commit timestamp with the first error occurrence time
+      3. Get the diff of that commit
+      4. Identify which file and function is causing the error
+      
+      Return: breaking_commit_sha, breaking_file, breaking_function, commit_diff
+    tools: [gitlab_api]
+    output: root_cause
+
+  - id: generate_fix
+    name: "4. Generate Code Fix"
+    prompt: |
+      Based on the root cause analysis:
+      {{ steps.trace_breaking_commit.root_cause }}
+      
+      And the original error:
+      {{ steps.investigate_logs.log_analysis }}
+      
+      Generate a minimal, targeted code fix that:
+      1. Resolves the specific error without introducing new issues
+      2. Adds proper error handling if missing
+      3. Includes a brief comment explaining what was fixed and why
+      4. Does NOT change unrelated code
+      
+      Create a new branch named: auto-heal/{{ incident_id }}-{{ timestamp }}
+      Commit the fix with message: "fix: auto-heal {{ error_type }} in {{ failing_function }} [skip ci]"
+      
+      Note: The commit message includes [skip ci] to prevent infinite loops.
+      A separate pipeline will be triggered after MR creation.
+    tools: [gitlab_api, code_editor]
+    output: fix_details
+
+  - id: create_merge_request
+    name: "5. Create Merge Request"
+    prompt: |
+      Create a Merge Request for the fix branch: {{ steps.generate_fix.fix_details.branch }}
+      
+      MR Title: "fix: Auto-heal {{ incident_context.alert_name }} - {{ incident_id }}"
+      
+      MR Description should include:
+      - ## 🚨 Incident Summary
+        - Alert: {{ incident_context.alert_name }}
+        - Severity: {{ incident_context.severity }}
+        - First occurrence: {{ incident_context.timestamp }}
+      - ## 🔍 Root Cause
+        - Breaking commit: {{ root_cause.breaking_commit_sha }}
+        - Failing function: {{ root_cause.breaking_function }}
+        - Error: {{ log_analysis.error_message }}
+      - ## 🛠️ Fix Applied
+        - Description of what was changed and why
+      - ## ✅ Validation Plan
+        - CI pipeline will run SAST + tests automatically
+        - Staging deployment will validate health endpoint
+        - Canary deployment to production if all checks pass
+      
+      Set labels: ["auto-healing", "incident", "bug"]
+      Set merge_when_pipeline_succeeds: true
+    tools: [gitlab_api]
+    output: mr_details
+
+  - id: monitor_pipeline
+    name: "6. Monitor CI Pipeline"
+    prompt: |
+      The MR has been created: {{ steps.create_merge_request.mr_details }}
+      
+      Monitor the CI pipeline:
+      1. Poll the pipeline status every 30 seconds
+      2. If pipeline succeeds: proceed to next step
+      3. If pipeline fails: analyze the failure, attempt to fix, or escalate
+      4. Timeout after 15 minutes
+      
+      Report the final pipeline status and any test failures.
+    tools: [gitlab_api]
+    output: pipeline_result
+
+  - id: write_postmortem
+    name: "7. Write Incident Postmortem"
+    prompt: |
+      The incident has been resolved. Write a structured postmortem.
+      
+      Post a comment on the incident issue: {{ incident_context.issue_iid }}
+      
+      ## 📋 Incident Postmortem - Auto-Generated
+      
+      **Incident ID:** {{ incident_id }}
+      **Resolution Time:** {{ resolution_time }}
+      **Status:** ✅ Resolved
+      
+      ### Timeline
+      - {{ incident_context.timestamp }}: Incident detected
+      - +N min: Root cause identified (commit: {{ root_cause.breaking_commit_sha }})
+      - +N min: Fix generated and MR created
+      - +N min: CI pipeline passed
+      - +N min: Deployed to staging, health checks passed
+      - +N min: Canary deployed to production
+      - +N min: Full traffic promoted, incident resolved
+      
+      ### Root Cause
+      {{ log_analysis.error_type }} in {{ root_cause.breaking_function }}
+      
+      ### Fix Applied
+      {{ fix_details.description }}
+      
+      ### Prevention Measures
+      Consider adding automated test for this error pattern.
+      
+      Close the incident issue and add label "resolved".
+    tools: [gitlab_api]
+    output: postmortem
